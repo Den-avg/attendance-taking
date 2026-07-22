@@ -167,11 +167,22 @@
             justify-content: space-between;
             align-items: center;
             transition: background 0.2s, border-color 0.2s;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .match-card:hover {
+            background: #f5f9ff;
+            border-color: #4285f4;
         }
 
         .match-card.selected {
             background: #e8f5e9;
             border-color: #34a853;
+        }
+
+        .match-card.selected:hover {
+            background: #ddf3df;
         }
 
         .match-card .out-of-frame-tag {
@@ -654,8 +665,12 @@
                     ? '<span class="out-of-frame-tag">not in frame</span>'
                     : '';
 
+                // Clicking anywhere on the card toggles selection.
+                // The checkbox stops its own click from bubbling up so the
+                // two handlers don't both fire and cancel each other out.
                 html += `
-                  <div class="match-card ${isSelected ? 'selected' : ''}">
+                  <div class="match-card ${isSelected ? 'selected' : ''}"
+                       onclick="toggleSelect('${escapedName}', ${!isSelected})">
                     <div>
                       <div class="match-name">${match.name}${tag}</div>
                       <div class="match-confidence">${Math.round(match.confidence * 100)}% confidence</div>
@@ -663,6 +678,7 @@
                     <div>
                       <input type="checkbox" class="checkbox"
                              ${isSelected ? 'checked' : ''}
+                             onclick="event.stopPropagation()"
                              onchange="toggleSelect('${escapedName}', this.checked)">
                     </div>
                   </div>`;
