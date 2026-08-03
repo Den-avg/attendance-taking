@@ -355,6 +355,7 @@
         const absenteeList  = document.getElementById('absenteeList');
 
         // ============ APPS SCRIPT API HELPERS ============
+        // NOTE: `action` can now include extra query params, e.g. `photo&fileId=xyz`
         async function apiGet(action) {
             const res = await fetch(`${APPS_SCRIPT_URL}?action=${action}`);
             if (!res.ok) throw new Error(`Request failed: ${res.status}`);
@@ -457,67 +458,102 @@
             await startCamera();
         }
 
-        // ============ LOAD STUDENTS ============
+        // ============ LOAD STUDENTS (v3 — roster + parallel photo fetch) ============
+        // Step 1: fetch a lightweight roster (names + fileIds only, no images).
+        // Step 2: fetch each student's photo individually as base64, in
+        //         parallel. Each response stays small, so no more
+        //         ERR_CONNECTION_RESET from one giant bulk payload.
+        // Base64 data URLs (not Drive hotlink URLs) are used so face-api.js's
+        // canvas/WebGL pixel reads never hit a CORS "tainted canvas" error.
         async function loadStudents() {
-            updateStatus('Loading students from Google Drive...');
+            updateStatus('Loading student roster...');
             labeledDescriptors = [];
             allDetectedMatches = [];
             selectedMatches.clear();
             renderMatchList();
 
             try {
-                const students = await apiGet('students');
-                handleStudentsLoaded(students);
+                const roster = await apiGet('roster');
+
+                if (!roster || roster.length === 0) {
+                    updateStatus('❌ No students found. Check your spreadsheet.', 'error');
+                    return;
+                }
+
+                updateStatus('✅ Found ' + roster.length + ' students. Loading photos...', 'success');
+
+                let completed = 0;
+                const results = await Promise.all(roster.map(async (student) => {
+                    try {
+                        const res = await apiGet(`photo&fileId=${encodeURIComponent(student.fileId)}`);
+                        completed++;
+                        updateProgress(completed, roster.length, 'Loaded ' + completed + '/' + roster.length + ' photos...');
+
+                        if (!res.success) {
+                            console.log('❌ ' + student.name + ': ' + res.error);
+                            return null;
+                        }
+                        return { name: student.name, imageData: res.imageData };
+                    } catch (e) {
+                        completed++;
+                        console.log('❌ ' + student.name + ': ' + e.message);
+                        return null;
+                    }
+                }));
+
+                const students = results.filter(s => s !== null);
+
+                if (students.length === 0) {
+                    updateStatus('❌ No student photos could be loaded', 'error');
+                    progressBar.style.width = '0%';
+                    progressText.innerHTML = '';
+                    return;
+                }
+
+                updateStatus('✅ Loaded ' + students.length + ' photos. Processing faces...', 'success');
+                await processStudentFaces(students);
+
             } catch (err) {
                 updateStatus('Error loading students: ' + err.message, 'error');
             }
         }
 
-        function handleStudentsLoaded(students) {
-            if (!students || students.length === 0) {
-                updateStatus('❌ No students found. Check your spreadsheet.', 'error');
-                return;
-            }
-            updateStatus('✅ Found ' + students.length + ' students. Processing faces...', 'success');
-            processStudents(students, 0);
-        }
+        // Detect + register a face descriptor for each loaded student photo.
+        async function processStudentFaces(students) {
+            labeledDescriptors = [];
 
-        async function processStudents(students, index) {
-            if (index >= students.length) {
-                if (labeledDescriptors.length > 0) {
-                    faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
-                    updateStatus('✅ Loaded ' + labeledDescriptors.length + ' student faces', 'success');
-                } else {
-                    updateStatus('❌ No faces could be detected in the images', 'error');
+            for (let i = 0; i < students.length; i++) {
+                const student = students[i];
+                updateProgress(i + 1, students.length, 'Detecting face: ' + student.name + '...');
+
+                try {
+                    const img = await loadImageFromDataURL(student.imageData);
+                    const detection = await faceapi
+                        .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
+                        .withFaceLandmarks()
+                        .withFaceDescriptor();
+
+                    if (detection) {
+                        labeledDescriptors.push(
+                            new faceapi.LabeledFaceDescriptors(student.name, [detection.descriptor])
+                        );
+                        console.log('✅ Loaded face for: ' + student.name);
+                    } else {
+                        console.log('❌ No face detected in: ' + student.name);
+                    }
+                } catch (e) {
+                    console.log('Failed to process ' + student.name + ': ' + e.message);
                 }
-                progressBar.style.width = '0%';
-                progressText.innerHTML  = '';
-                return;
             }
 
-            const student = students[index];
-            updateProgress(index + 1, students.length, 'Processing ' + student.name + '...');
-
-            try {
-                const img = await loadImageFromDataURL(student.imageData);
-                const detection = await faceapi
-                    .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
-                    .withFaceLandmarks()
-                    .withFaceDescriptor();
-
-                if (detection) {
-                    labeledDescriptors.push(
-                        new faceapi.LabeledFaceDescriptors(student.name, [detection.descriptor])
-                    );
-                    console.log('✅ Loaded face for: ' + student.name);
-                } else {
-                    console.log('❌ No face detected in: ' + student.name);
-                }
-            } catch (e) {
-                console.log('Failed to load ' + student.name + ': ' + e.message);
+            if (labeledDescriptors.length > 0) {
+                faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+                updateStatus('✅ Loaded ' + labeledDescriptors.length + ' student faces', 'success');
+            } else {
+                updateStatus('❌ No faces could be detected in the images', 'error');
             }
-
-            setTimeout(() => processStudents(students, index + 1), 50);
+            progressBar.style.width = '0%';
+            progressText.innerHTML  = '';
         }
 
         function loadImageFromDataURL(dataURL) {
