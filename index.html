@@ -477,14 +477,19 @@ const res = await fetch(url, {
             await startCamera();
         }
 
-        // ============ LOAD STUDENTS (v4 — single roster call, CORS-enabled image URLs) ============
-        // The individual per-student "photo" endpoint proved unreliable
-        // (intermittent 404s from Apps Script's echo-redirect layer, even
-        // with retries and sequential requests, despite the script itself
-        // completing every execution without error). The "roster" call has
-        // been 100% reliable in every test, so we go back to a single call
-        // and load images directly via a CORS-enabled Drive CDN URL instead
-        // of round-tripping through Apps Script for each photo.
+        // ============ LOAD STUDENTS (v5 — base64 imageData, no CORS dependency) ============
+        // Earlier versions tried a per-student "photo" endpoint (unreliable,
+        // intermittent 404s from Apps Script's echo-redirect layer) and then
+        // a "roster" endpoint returning raw Drive/CDN image URLs loaded with
+        // crossOrigin="anonymous". That second approach broke because
+        // lh3.googleusercontent.com doesn't reliably send
+        // Access-Control-Allow-Origin, so the browser blocked the pixel
+        // reads face-api.js needs and threw a CORS / tainted-canvas error.
+        //
+        // Fix: go back to the "students" action, which returns each photo
+        // as a base64 data: URI (imageData) baked directly into the JSON
+        // response. A data: URI is never a cross-origin request, so there
+        // is nothing for CORS to block — no crossOrigin flag needed either.
         async function loadStudents() {
             updateStatus('Loading student roster...');
             labeledDescriptors = [];
@@ -493,7 +498,7 @@ const res = await fetch(url, {
             renderMatchList();
 
             try {
-                const roster = await apiGet('roster');
+                const roster = await apiGet('students');
 
                 if (!roster || roster.length === 0) {
                     updateStatus('❌ No students found. Check your spreadsheet.', 'error');
@@ -508,7 +513,7 @@ const res = await fetch(url, {
             }
         }
 
-        // Detect + register a face descriptor for each student's image URL.
+        // Detect + register a face descriptor for each student's base64 image.
         async function processStudentFaces(students) {
             labeledDescriptors = [];
 
@@ -517,7 +522,7 @@ const res = await fetch(url, {
                 updateProgress(i + 1, students.length, 'Detecting face: ' + student.name + '...');
 
                 try {
-                    const img = await loadImageFromUrl(student.imageUrl);
+                    const img = await loadImageFromUrl(student.imageData);
                     const detection = await faceapi
                         .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
                         .withFaceLandmarks()
@@ -546,15 +551,16 @@ const res = await fetch(url, {
             progressText.innerHTML  = '';
         }
 
-        // Loads an image via crossOrigin="anonymous" so canvas/WebGL pixel
-        // reads (face-api.js) don't throw a "tainted canvas" SecurityError —
-        // this only works if the server sends proper CORS headers.
+        // Loads an image from a source string. When the source is a base64
+        // data: URI (the normal case now) this never touches the network,
+        // so no CORS handling is needed. crossOrigin is left off since it's
+        // irrelevant for data: URIs and only matters for actual cross-origin
+        // network requests.
         function loadImageFromUrl(url) {
             return new Promise((resolve, reject) => {
                 const img = new Image();
-                img.crossOrigin = 'anonymous';
                 img.onload  = () => resolve(img);
-                img.onerror = () => reject(new Error('Failed to load image: ' + url));
+                img.onerror = () => reject(new Error('Failed to load image'));
                 img.src = url;
             });
         }
