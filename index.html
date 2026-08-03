@@ -472,13 +472,14 @@
             await startCamera();
         }
 
-        // ============ LOAD STUDENTS (v3 — roster + parallel photo fetch) ============
-        // Step 1: fetch a lightweight roster (names + fileIds only, no images).
-        // Step 2: fetch each student's photo individually as base64, in
-        //         parallel. Each response stays small, so no more
-        //         ERR_CONNECTION_RESET from one giant bulk payload.
-        // Base64 data URLs (not Drive hotlink URLs) are used so face-api.js's
-        // canvas/WebGL pixel reads never hit a CORS "tainted canvas" error.
+        // ============ LOAD STUDENTS (v4 — single roster call, CORS-enabled image URLs) ============
+        // The individual per-student "photo" endpoint proved unreliable
+        // (intermittent 404s from Apps Script's echo-redirect layer, even
+        // with retries and sequential requests, despite the script itself
+        // completing every execution without error). The "roster" call has
+        // been 100% reliable in every test, so we go back to a single call
+        // and load images directly via a CORS-enabled Drive CDN URL instead
+        // of round-tripping through Apps Script for each photo.
         async function loadStudents() {
             updateStatus('Loading student roster...');
             labeledDescriptors = [];
@@ -494,54 +495,15 @@
                     return;
                 }
 
-                updateStatus('✅ Found ' + roster.length + ' students. Loading photos...', 'success');
-
-                // Fetch in small batches (not all 36 at once) — Apps Script
-                // enforces a per-user simultaneous execution quota, and firing
-                // too many parallel requests at once causes some to get
-                // dropped/reset rather than queued.
-                const BATCH_SIZE = 6;
-                let completed = 0;
-                const students = [];
-
-                for (let i = 0; i < roster.length; i += BATCH_SIZE) {
-                    const batch = roster.slice(i, i + BATCH_SIZE);
-                    const batchResults = await Promise.all(batch.map(async (student) => {
-                        try {
-                            const res = await apiGet(`photo&fileId=${encodeURIComponent(student.fileId)}`);
-                            completed++;
-                            updateProgress(completed, roster.length, 'Loaded ' + completed + '/' + roster.length + ' photos...');
-
-                            if (!res.success) {
-                                console.log('❌ ' + student.name + ': ' + res.error);
-                                return null;
-                            }
-                            return { name: student.name, imageData: res.imageData };
-                        } catch (e) {
-                            completed++;
-                            console.log('❌ ' + student.name + ': ' + e.message);
-                            return null;
-                        }
-                    }));
-                    students.push(...batchResults.filter(s => s !== null));
-                }
-
-                if (students.length === 0) {
-                    updateStatus('❌ No student photos could be loaded', 'error');
-                    progressBar.style.width = '0%';
-                    progressText.innerHTML = '';
-                    return;
-                }
-
-                updateStatus('✅ Loaded ' + students.length + ' photos. Processing faces...', 'success');
-                await processStudentFaces(students);
+                updateStatus('✅ Found ' + roster.length + ' students. Processing faces...', 'success');
+                await processStudentFaces(roster);
 
             } catch (err) {
                 updateStatus('Error loading students: ' + err.message, 'error');
             }
         }
 
-        // Detect + register a face descriptor for each loaded student photo.
+        // Detect + register a face descriptor for each student's image URL.
         async function processStudentFaces(students) {
             labeledDescriptors = [];
 
@@ -550,7 +512,7 @@
                 updateProgress(i + 1, students.length, 'Detecting face: ' + student.name + '...');
 
                 try {
-                    const img = await loadImageFromDataURL(student.imageData);
+                    const img = await loadImageFromUrl(student.imageUrl);
                     const detection = await faceapi
                         .detectSingleFace(img, new faceapi.TinyFaceDetectorOptions())
                         .withFaceLandmarks()
@@ -579,12 +541,16 @@
             progressText.innerHTML  = '';
         }
 
-        function loadImageFromDataURL(dataURL) {
+        // Loads an image via crossOrigin="anonymous" so canvas/WebGL pixel
+        // reads (face-api.js) don't throw a "tainted canvas" SecurityError —
+        // this only works if the server sends proper CORS headers.
+        function loadImageFromUrl(url) {
             return new Promise((resolve, reject) => {
-                const img  = new Image();
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
                 img.onload  = () => resolve(img);
-                img.onerror = () => reject(new Error('Failed to load image from data URL'));
-                img.src = dataURL;
+                img.onerror = () => reject(new Error('Failed to load image: ' + url));
+                img.src = url;
             });
         }
 
