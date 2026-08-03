@@ -356,10 +356,24 @@
 
         // ============ APPS SCRIPT API HELPERS ============
         // NOTE: `action` can now include extra query params, e.g. `photo&fileId=xyz`
-        async function apiGet(action) {
-            const res = await fetch(`${APPS_SCRIPT_URL}?action=${action}`);
-            if (!res.ok) throw new Error(`Request failed: ${res.status}`);
-            return res.json();
+        //
+        // Apps Script's script.googleusercontent.com echo redirect is known to
+        // intermittently 404 even on a healthy, correctly-deployed web app —
+        // it's a platform quirk, not necessarily a bug in our code. Retrying
+        // a couple of times with a short delay resolves the vast majority of
+        // these without the user needing to notice or refresh manually.
+        async function apiGet(action, retries = 2) {
+            for (let attempt = 0; attempt <= retries; attempt++) {
+                try {
+                    const res = await fetch(`${APPS_SCRIPT_URL}?action=${action}`);
+                    if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+                    return await res.json();
+                } catch (err) {
+                    if (attempt === retries) throw err;
+                    console.log(`apiGet(${action}) failed, retrying (${attempt + 1}/${retries})...`);
+                    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                }
+            }
         }
 
         async function apiPost(action, payload) {
