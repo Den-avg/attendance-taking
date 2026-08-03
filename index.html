@@ -482,26 +482,35 @@
 
                 updateStatus('✅ Found ' + roster.length + ' students. Loading photos...', 'success');
 
+                // Fetch in small batches (not all 36 at once) — Apps Script
+                // enforces a per-user simultaneous execution quota, and firing
+                // too many parallel requests at once causes some to get
+                // dropped/reset rather than queued.
+                const BATCH_SIZE = 6;
                 let completed = 0;
-                const results = await Promise.all(roster.map(async (student) => {
-                    try {
-                        const res = await apiGet(`photo&fileId=${encodeURIComponent(student.fileId)}`);
-                        completed++;
-                        updateProgress(completed, roster.length, 'Loaded ' + completed + '/' + roster.length + ' photos...');
+                const students = [];
 
-                        if (!res.success) {
-                            console.log('❌ ' + student.name + ': ' + res.error);
+                for (let i = 0; i < roster.length; i += BATCH_SIZE) {
+                    const batch = roster.slice(i, i + BATCH_SIZE);
+                    const batchResults = await Promise.all(batch.map(async (student) => {
+                        try {
+                            const res = await apiGet(`photo&fileId=${encodeURIComponent(student.fileId)}`);
+                            completed++;
+                            updateProgress(completed, roster.length, 'Loaded ' + completed + '/' + roster.length + ' photos...');
+
+                            if (!res.success) {
+                                console.log('❌ ' + student.name + ': ' + res.error);
+                                return null;
+                            }
+                            return { name: student.name, imageData: res.imageData };
+                        } catch (e) {
+                            completed++;
+                            console.log('❌ ' + student.name + ': ' + e.message);
                             return null;
                         }
-                        return { name: student.name, imageData: res.imageData };
-                    } catch (e) {
-                        completed++;
-                        console.log('❌ ' + student.name + ': ' + e.message);
-                        return null;
-                    }
-                }));
-
-                const students = results.filter(s => s !== null);
+                    }));
+                    students.push(...batchResults.filter(s => s !== null));
+                }
 
                 if (students.length === 0) {
                     updateStatus('❌ No student photos could be loaded', 'error');
