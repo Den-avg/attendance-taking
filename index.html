@@ -115,6 +115,7 @@
         .btn-success { background: #34a853; color: white; }
         .btn-danger  { background: #ea4335; color: white; }
         .btn-warning { background: #fbbc05; color: black; }
+        .btn-outline { background: white; color: #4285f4; border: 1px solid #4285f4; }
 
         .status {
             padding: 15px;
@@ -279,7 +280,8 @@
             <div style="text-align: center; margin: 20px 0;">
                 <button class="btn-primary"  onclick="switchCamera()">🔄 Switch Camera</button>
                 <button class="btn-primary"  onclick="toggleCamera()">📹 On/Off</button>
-                <button class="btn-success"  onclick="loadStudents()">📚 Load Students</button>
+                <button class="btn-success"  onclick="loadStudents()" id="loadStudentsBtn">📚 Load Students</button>
+                <button class="btn-outline"  onclick="rebuildRosterCache()" title="Force the server to re-fetch and re-encode every student photo from Drive (use after replacing photos)">🧹 Rebuild Cache</button>
                 <button class="btn-success"  onclick="startRecognition()">▶️ Start</button>
                 <button class="btn-warning"  onclick="stopRecognition()">⏹️ Stop</button>
                 <button class="btn-primary"  onclick="confirmAttendance()" id="confirmBtn" disabled>✅ Confirm</button>
@@ -320,7 +322,32 @@
 
         // ============ CONFIG ============
         // Your Apps Script Web App /exec URL (must end in /exec)
-        const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwy1WCYIev69ls04A8sYJYywT_EKncuLyIoC6wZ5Jpi_kd-5WjcyEUdPRwLdEfNN-5O/exec";
+        const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwtVu4jLvIxmBDbYQ47PFAdRR5LzXSQ5FNlLIgoaskviERKVlWnqAuTyznkNFyPN0pogg/exec";
+
+        // Per-action timeout budget (ms). "students" hits a Drive-file cache
+        // on the server most of the time, but a COLD cache (first run ever,
+        // or right after photos change) has to fetch+base64-encode every
+        // photo from Drive, which can legitimately take well over a minute
+        // for a full class roster. Give it a lot of room.
+        const API_TIMEOUTS = {
+            students:    120000, // cold cache: fetch + encode N Drive images, plus cache-file write
+            absentees:     8000,
+            verify:      120000, // verify also calls getRegisteredStudents()
+            clearCache:    8000
+        };
+        const DEFAULT_TIMEOUT = 8000;
+
+        // Actions that must NEVER auto-retry on timeout. Apps Script does not
+        // cancel server-side execution just because the client's fetch was
+        // aborted — retrying a slow action fires a brand-new doGet execution
+        // while the previous one is STILL running server-side. For a cheap
+        // call like "absentees" that's harmless. For "students"/"verify"
+        // (which both run the full Drive fetch+encode pipeline) it stacks up
+        // multiple concurrent executions competing for the same Drive/
+        // UrlFetch quota, which makes every attempt slower and produces more
+        // timeouts — a feedback loop, not a recovery. So these get exactly
+        // one attempt with a generous budget instead.
+        const NO_RETRY_ACTIONS = { students: true, verify: true };
 
         // ============ GLOBAL VARIABLES ============
         const video      = document.getElementById('video');
@@ -353,37 +380,50 @@
         const matchesList   = document.getElementById('matchesList');
         const noMatches     = document.getElementById('noMatches');
         const absenteeList  = document.getElementById('absenteeList');
+        const loadStudentsBtn = document.getElementById('loadStudentsBtn');
 
         // ============ APPS SCRIPT API HELPERS ============
-        // NOTE: `action` can now include extra query params, e.g. `photo&fileId=xyz`
+        // NOTE: `action` can include extra query params, e.g. `photo&fileId=xyz`
         //
         // Apps Script's script.googleusercontent.com echo redirect is known to
         // intermittently 404 even on a healthy, correctly-deployed web app —
         // it's a platform quirk, not necessarily a bug in our code. Retrying
         // a couple of times with a short delay resolves the vast majority of
         // these without the user needing to notice or refresh manually.
-        async function apiGet(action, retries = 3) {
-    for (let attempt = 0; attempt <= retries; attempt++) {
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s cap
-        try {
-            const url = `${APPS_SCRIPT_URL}?action=${action}&_=${Date.now()}`;
-            const res = await fetch(url, {
-                mode: "cors",
-                cache: "no-store",
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            if (!res.ok) throw new Error(`Request failed: ${res.status}`);
-            return await res.json();
-        } catch (err) {
-            clearTimeout(timeoutId);
-            if (attempt === retries) throw err;
-            console.log(`apiGet(${action}) failed, retrying (${attempt + 1}/${retries})...`);
-            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        // BUT: retries are only safe for cheap/idempotent actions — see
+        // NO_RETRY_ACTIONS above. "students" and "verify" get exactly one
+        // attempt so a slow response never causes duplicate, competing
+        // server-side executions.
+        async function apiGet(action, retries, timeoutMs) {
+            const effectiveRetries = NO_RETRY_ACTIONS[action] ? 0 : (retries ?? 3);
+            const budget = timeoutMs || API_TIMEOUTS[action] || DEFAULT_TIMEOUT;
+
+            for (let attempt = 0; attempt <= effectiveRetries; attempt++) {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), budget);
+                try {
+                    const url = `${APPS_SCRIPT_URL}?action=${action}&_=${Date.now()}`;
+                    const res = await fetch(url, {
+                        mode: "cors",
+                        cache: "no-store",
+                        signal: controller.signal
+                    });
+                    clearTimeout(timeoutId);
+                    if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+                    return await res.json();
+                } catch (err) {
+                    clearTimeout(timeoutId);
+                    if (attempt === effectiveRetries) {
+                        if (err && err.name === 'AbortError') {
+                            throw new Error(`Request timed out after ${Math.round(budget / 1000)}s. The server may still be working — wait a bit before trying again rather than clicking repeatedly.`);
+                        }
+                        throw err;
+                    }
+                    console.log(`apiGet(${action}) failed, retrying (${attempt + 1}/${effectiveRetries})...`);
+                    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+                }
+            }
         }
-    }
-}
 
         async function apiPost(action, payload) {
             const res = await fetch(APPS_SCRIPT_URL, {
@@ -481,21 +521,23 @@
             await startCamera();
         }
 
-        // ============ LOAD STUDENTS (v5 — base64 imageData, no CORS dependency) ============
-        // Earlier versions tried a per-student "photo" endpoint (unreliable,
-        // intermittent 404s from Apps Script's echo-redirect layer) and then
-        // a "roster" endpoint returning raw Drive/CDN image URLs loaded with
-        // crossOrigin="anonymous". That second approach broke because
-        // lh3.googleusercontent.com doesn't reliably send
-        // Access-Control-Allow-Origin, so the browser blocked the pixel
-        // reads face-api.js needs and threw a CORS / tainted-canvas error.
+        // ============ LOAD STUDENTS (v7 — single-attempt, no retry storm) ============
+        // The Apps Script backend caches the encoded roster in a Drive file,
+        // keyed by a hash of the Name/Photo_URL columns. Most calls return
+        // almost instantly. The one case that's still slow is a cold cache
+        // (first run ever, or right after photos were swapped) — that's why
+        // "students" gets a long client-side timeout AND is excluded from
+        // retries (see NO_RETRY_ACTIONS): retrying a still-running cold
+        // rebuild just spawns a second competing execution instead of
+        // speeding anything up.
         //
-        // Fix: go back to the "students" action, which returns each photo
-        // as a base64 data: URI (imageData) baked directly into the JSON
-        // response. A data: URI is never a cross-origin request, so there
-        // is nothing for CORS to block — no crossOrigin flag needed either.
+        // The button is disabled while a load is in flight so a user can't
+        // accidentally trigger that same problem by clicking repeatedly.
         async function loadStudents() {
-            updateStatus('Loading student roster...');
+            if (loadStudentsBtn.disabled) return; // already loading
+            loadStudentsBtn.disabled = true;
+
+            updateStatus('Loading student roster (first load after a photo change can take a minute or two)...');
             labeledDescriptors = [];
             allDetectedMatches = [];
             selectedMatches.clear();
@@ -514,6 +556,22 @@
 
             } catch (err) {
                 updateStatus('Error loading students: ' + err.message, 'error');
+            } finally {
+                loadStudentsBtn.disabled = false;
+            }
+        }
+
+        // Forces the server to drop its cached roster and re-fetch/re-encode
+        // every photo from Drive on the next "Load Students" click. Use this
+        // right after replacing a student's photo — otherwise the cache hash
+        // only changes when Name/Photo_URL cell values themselves change.
+        async function rebuildRosterCache() {
+            updateStatus('Clearing server-side roster cache...');
+            try {
+                const res = await apiGet('clearCache');
+                updateStatus('✅ ' + (res.message || 'Cache cleared') + ' Wait a moment, then click "Load Students" to rebuild.', 'success');
+            } catch (err) {
+                handleError(err);
             }
         }
 
@@ -815,7 +873,8 @@
                 if (data.success) {
                     updateStatus(data.message, 'success');
                     alert('✅ Setup OK!\n\nStudents found: ' + data.studentCount +
-                          '\nSample: ' + (data.samples ? data.samples.join(', ') : 'None'));
+                          '\nSample: ' + (data.samples ? data.samples.join(', ') : 'None') +
+                          '\nCache active: ' + (data.cacheActive ? 'yes' : 'no'));
                 } else {
                     updateStatus(data.message, 'error');
                     alert('❌ Setup Error:\n\n' + data.message);
@@ -851,6 +910,7 @@
         window.switchCamera      = switchCamera;
         window.toggleCamera      = toggleCamera;
         window.loadStudents      = loadStudents;
+        window.rebuildRosterCache= rebuildRosterCache;
         window.startRecognition  = startRecognition;
         window.stopRecognition   = stopRecognition;
         window.confirmAttendance = confirmAttendance;
