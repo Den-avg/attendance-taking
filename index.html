@@ -362,24 +362,28 @@
         // it's a platform quirk, not necessarily a bug in our code. Retrying
         // a couple of times with a short delay resolves the vast majority of
         // these without the user needing to notice or refresh manually.
-        async function apiGet(action, retries = 2) {
-            for (let attempt = 0; attempt <= retries; attempt++) {
-                try {
-                   const url =
-    `${APPS_SCRIPT_URL}?action=${action}&_=${Date.now()}`;
-const res = await fetch(url, {
-    mode: "cors",
-    cache: "no-store"
-});
-                    if (!res.ok) throw new Error(`Request failed: ${res.status}`);
-                    return await res.json();
-                } catch (err) {
-                    if (attempt === retries) throw err;
-                    console.log(`apiGet(${action}) failed, retrying (${attempt + 1}/${retries})...`);
-                    await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-                }
-            }
+        async function apiGet(action, retries = 3) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s cap
+        try {
+            const url = `${APPS_SCRIPT_URL}?action=${action}&_=${Date.now()}`;
+            const res = await fetch(url, {
+                mode: "cors",
+                cache: "no-store",
+                signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+            return await res.json();
+        } catch (err) {
+            clearTimeout(timeoutId);
+            if (attempt === retries) throw err;
+            console.log(`apiGet(${action}) failed, retrying (${attempt + 1}/${retries})...`);
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
         }
+    }
+}
 
         async function apiPost(action, payload) {
             const res = await fetch(APPS_SCRIPT_URL, {
